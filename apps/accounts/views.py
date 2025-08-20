@@ -739,3 +739,642 @@ class StaffDetailView(LoginRequiredMixin, DetailView):
         })
         
         return context
+
+# //////////////////////////////////////////////////////////////////////////////////////////////
+
+
+from django.shortcuts import render, redirect, get_object_or_404
+from django.contrib.auth import login, logout, authenticate, get_user_model
+from django.contrib.auth.decorators import login_required
+from django.contrib.auth.mixins import LoginRequiredMixin, PermissionRequiredMixin
+from django.contrib import messages
+from django.views.generic import (
+    TemplateView, ListView, CreateView, UpdateView, DetailView, DeleteView, FormView
+)
+from django.views import View
+from django.urls import reverse_lazy, reverse
+from django.http import JsonResponse, HttpResponse, HttpResponseRedirect
+from django.db.models import Q, Count
+from django.core.paginator import Paginator
+from django.utils.decorators import method_decorator
+from django.views.decorators.csrf import csrf_exempt
+from django.contrib.auth.forms import AuthenticationForm
+from rest_framework import viewsets, status, permissions
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from rest_framework.views import APIView
+from rest_framework.authtoken.models import Token
+from .models import UserProfile, Role, Permission
+from .forms import (
+    CustomUserCreationForm, CustomAuthenticationForm, UserProfileForm,
+    RoleForm, PasswordResetForm, UserSearchForm, BulkUserActionForm
+)
+from .serializers import (
+    UserSerializer, UserProfileSerializer, RoleSerializer, PermissionSerializer,
+    UserRegistrationSerializer, UserLoginSerializer, PasswordChangeSerializer,
+    UserListSerializer, UserStatsSerializer
+)
+
+User = get_user_model()
+
+
+# Authentication Views
+class LoginView(FormView):
+    """User login view"""
+    template_name = 'accounts/login.html'
+    form_class = CustomAuthenticationForm
+    success_url = reverse_lazy('accounts:dashboard')
+
+    def dispatch(self, request, *args, **kwargs):
+        if request.user.is_authenticated:
+            return redirect(self.success_url)
+        return super().dispatch(request, *args, **kwargs)
+
+    def form_valid(self, form):
+        user = form.get_user()
+        login(self.request, user)
+        
+        # Update login IP
+        try:
+            profile = user.userprofile
+            profile.last_login_ip = self.get_client_ip()
+            profile.login_attempts = 0
+            profile.save()
+        except UserProfile.DoesNotExist:
+            pass
+        
+        messages.success(self.request, f'Welcome back, {user.get_full_name() or user.username}!')
+        return super().form_valid(form)
+
+    def get_client_ip(self):
+        x_forwarded_for = self.request.META.get('HTTP_X_FORWARDED_FOR')
+        if x_forwarded_for:
+            ip = x_forwarded_for.split(',')[0]
+        else:
+            ip = self.request.META.get('REMOTE_ADDR')
+        return ip
+
+
+class LogoutView(View):
+    """User logout view"""
+    
+    def get(self, request):
+        logout(request)
+        messages.success(request, 'You have been logged out successfully.')
+        return redirect('accounts:login')
+
+
+class RegisterView(CreateView):
+    """User registration view"""
+    template_name = 'accounts/register.html'
+    form_class = CustomUserCreationForm
+    success_url = reverse_lazy('accounts:login')
+
+    def dispatch(self, request, *args, **kwargs):
+        if request.user.is_authenticated:
+            return redirect('accounts:dashboard')
+        return super().dispatch(request, *args, **kwargs)
+
+    def form_valid(self, form):
+        response = super().form_valid(form)
+        messages.success(self.request, 'Account created successfully! Please log in.')
+        return response
+
+
+class DashboardView(LoginRequiredMixin, TemplateView):
+    """Main dashboard view"""
+    template_name = 'accounts/dashboard.html'
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        user = self.request.user
+        
+        try:
+            profile = user.userprofile
+            context['profile'] = profile
+            context['entity'] = profile.entity
+        except UserProfile.DoesNotExist:
+            context['profile'] = None
+            context['entity'] = None
+        
+        # Add dashboard stats based on user role
+        context['quick_stats'] = self.get_quick_stats()
+        context['recent_activities'] = self.get_recent_activities()
+        
+        return context
+
+    def get_quick_stats(self):
+        """Get quick statistics for dashboard"""
+        from apps.sales.models import Sale
+        from apps.inventory.models import Product
+        from apps.customers.models import Customer
+        from apps.vendors.models import Vendor
+        from django.utils import timezone
+        
+        today = timezone.now().date()
+        
+        stats = {
+            'today_sales': Sale.objects.filter(sale_date=today).count(),
+            'total_products': Product.objects.filter(status='active').count(),
+            'total_customers': Customer.objects.filter(is_active=True).count(),
+            'total_vendors': Vendor.objects.filter(is_active=True).count(),
+        }
+        
+        return stats
+
+    def get_recent_activities(self):
+        """Get recent activities for dashboard"""
+        activities = []
+        # Add logic to fetch recent activities
+        return activities
+
+
+class ProfileView(LoginRequiredMixin, DetailView):
+    """User profile view"""
+    template_name = 'accounts/profile.html'
+    context_object_name = 'profile'
+
+    def get_object(self):
+        profile, created = UserProfile.objects.get_or_create(user=self.request.user)
+        return profile
+
+
+class ProfileEditView(LoginRequiredMixin, UpdateView):
+    """Edit user profile view"""
+    template_name = 'accounts/profile_edit.html'
+    form_class = UserProfileForm
+    success_url = reverse_lazy('accounts:profile')
+
+    def get_object(self):
+        profile, created = UserProfile.objects.get_or_create(user=self.request.user)
+        return profile
+
+    def get_form_kwargs(self):
+        kwargs = super().get_form_kwargs()
+        kwargs['user'] = self.request.user
+        return kwargs
+
+    def form_valid(self, form):
+        messages.success(self.request, 'Profile updated successfully!')
+        return super().form_valid(form)
+
+
+# User Management Views
+class UserListView(LoginRequiredMixin, PermissionRequiredMixin, ListView):
+    """List all users"""
+    model = User
+    template_name = 'accounts/user_list.html'
+    context_object_name = 'users'
+    paginate_by = 20
+    permission_required = 'accounts.view_user'
+
+    def get_queryset(self):
+        queryset = User.objects.select_related('userprofile', 'userprofile__role')
+        
+        # Apply search filters
+        search_form = UserSearchForm(self.request.GET)
+        if search_form.is_valid():
+            search_query = search_form.cleaned_data.get('search_query')
+            entity = search_form.cleaned_data.get('entity')
+            role = search_form.cleaned_data.get('role')
+            is_active = search_form.cleaned_data.get('is_active')
+            
+            if search_query:
+                queryset = queryset.filter(
+                    Q(username__icontains=search_query) |
+                    Q(first_name__icontains=search_query) |
+                    Q(last_name__icontains=search_query) |
+                    Q(email__icontains=search_query)
+                )
+            
+            if entity:
+                queryset = queryset.filter(userprofile__entity=entity)
+            
+            if role:
+                queryset = queryset.filter(userprofile__role=role)
+            
+            if is_active == 'true':
+                queryset = queryset.filter(is_active=True)
+            elif is_active == 'false':
+                queryset = queryset.filter(is_active=False)
+        
+        return queryset.order_by('-date_joined')
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context['search_form'] = UserSearchForm(self.request.GET)
+        return context
+
+
+class UserCreateView(LoginRequiredMixin, PermissionRequiredMixin, CreateView):
+    """Create new user"""
+    model = User
+    template_name = 'accounts/user_form.html'
+    form_class = CustomUserCreationForm
+    success_url = reverse_lazy('accounts:user_list')
+    permission_required = 'accounts.add_user'
+
+    def form_valid(self, form):
+        messages.success(self.request, 'User created successfully!')
+        return super().form_valid(form)
+
+
+class UserDetailView(LoginRequiredMixin, PermissionRequiredMixin, DetailView):
+    """View user details"""
+    model = User
+    template_name = 'accounts/user_detail.html'
+    context_object_name = 'user_obj'
+    permission_required = 'accounts.view_user'
+
+    def get_queryset(self):
+        return User.objects.select_related('userprofile', 'userprofile__role')
+
+
+# API Views
+class UserViewSet(viewsets.ModelViewSet):
+    """ViewSet for User CRUD operations"""
+    queryset = User.objects.all()
+    serializer_class = UserSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        queryset = User.objects.select_related('userprofile')
+        
+        # Filter by entity if user is not superuser
+        if not self.request.user.is_superuser:
+            try:
+                user_entity = self.request.user.userprofile.entity
+                queryset = queryset.filter(userprofile__entity=user_entity)
+            except UserProfile.DoesNotExist:
+                pass
+        
+        return queryset
+
+    def get_serializer_class(self):
+        if self.action == 'list':
+            return UserListSerializer
+        return UserSerializer
+
+    @action(detail=True, methods=['post'])
+    def toggle_active(self, request, pk=None):
+        """Toggle user active status"""
+        user = self.get_object()
+        user.is_active = not user.is_active
+        user.save()
+        return Response({'status': 'success', 'is_active': user.is_active})
+
+    @action(detail=False, methods=['get'])
+    def stats(self, request):
+        """Get user statistics"""
+        stats = {
+            'total_users': User.objects.count(),
+            'active_users': User.objects.filter(is_active=True).count(),
+            'inactive_users': User.objects.filter(is_active=False).count(),
+            'staff_users': User.objects.filter(is_staff=True).count(),
+            'mpshoes_users': User.objects.filter(userprofile__entity='mpshoes').count(),
+            'mpfootwear_users': User.objects.filter(userprofile__entity='mpfootwear').count(),
+            'recent_logins': User.objects.filter(last_login__date=timezone.now().date()).count(),
+        }
+        serializer = UserStatsSerializer(stats)
+        return Response(serializer.data)
+
+
+class UserProfileViewSet(viewsets.ModelViewSet):
+    """ViewSet for UserProfile CRUD operations"""
+    queryset = UserProfile.objects.all()
+    serializer_class = UserProfileSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        queryset = UserProfile.objects.select_related('user', 'role')
+        
+        # Filter by entity if user is not superuser
+        if not self.request.user.is_superuser:
+            try:
+                user_entity = self.request.user.userprofile.entity
+                queryset = queryset.filter(entity=user_entity)
+            except UserProfile.DoesNotExist:
+                pass
+        
+        return queryset
+
+
+class RoleViewSet(viewsets.ModelViewSet):
+    """ViewSet for Role CRUD operations"""
+    queryset = Role.objects.all()
+    serializer_class = RoleSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        return Role.objects.prefetch_related('permissions').filter(is_active=True)
+
+
+class PermissionViewSet(viewsets.ModelViewSet):
+    """ViewSet for Permission CRUD operations"""
+    queryset = Permission.objects.all()
+    serializer_class = PermissionSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        return Permission.objects.filter(is_active=True)
+
+
+# API Authentication Views
+class APILoginView(APIView):
+    """API login view"""
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        serializer = UserLoginSerializer(data=request.data)
+        if serializer.is_valid():
+            user = serializer.validated_data['user']
+            token, created = Token.objects.get_or_create(user=user)
+            
+            return Response({
+                'token': token.key,
+                'user': UserSerializer(user).data,
+                'message': 'Login successful'
+            })
+        
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class APILogoutView(APIView):
+    """API logout view"""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        try:
+            request.user.auth_token.delete()
+        except Token.DoesNotExist:
+            pass
+        
+        return Response({'message': 'Logout successful'})
+
+
+class APIRegisterView(APIView):
+    """API registration view"""
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        serializer = UserRegistrationSerializer(data=request.data)
+        if serializer.is_valid():
+            user = serializer.save()
+            token, created = Token.objects.get_or_create(user=user)
+            
+            return Response({
+                'token': token.key,
+                'user': UserSerializer(user).data,
+                'message': 'Registration successful'
+            }, status=status.HTTP_201_CREATED)
+        
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class APIPasswordChangeView(APIView):
+    """API password change view"""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        serializer = PasswordChangeSerializer(data=request.data, context={'request': request})
+        if serializer.is_valid():
+            serializer.save()
+            return Response({'message': 'Password changed successfully'})
+        
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class APIProfileView(APIView):
+    """API profile view"""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        try:
+            profile = request.user.userprofile
+            serializer = UserProfileSerializer(profile)
+            return Response(serializer.data)
+        except UserProfile.DoesNotExist:
+            return Response({'error': 'Profile not found'}, status=status.HTTP_404_NOT_FOUND)
+
+    def put(self, request):
+        try:
+            profile = request.user.userprofile
+            serializer = UserProfileSerializer(profile, data=request.data, partial=True)
+            if serializer.is_valid():
+                serializer.save()
+                return Response(serializer.data)
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        except UserProfile.DoesNotExist:
+            return Response({'error': 'Profile not found'}, status=status.HTTP_404_NOT_FOUND)
+
+
+class UserStatsAPIView(APIView):
+    """API view for user statistics"""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        from django.utils import timezone
+        
+        stats = {
+            'total_users': User.objects.count(),
+            'active_users': User.objects.filter(is_active=True).count(),
+            'inactive_users': User.objects.filter(is_active=False).count(),
+            'staff_users': User.objects.filter(is_staff=True).count(),
+            'mpshoes_users': User.objects.filter(userprofile__entity='mpshoes').count(),
+            'mpfootwear_users': User.objects.filter(userprofile__entity='mpfootwear').count(),
+            'recent_logins': User.objects.filter(last_login__date=timezone.now().date()).count(),
+        }
+        
+        serializer = UserStatsSerializer(stats)
+        return Response(serializer.data)
+
+
+# AJAX Views
+class CheckUsernameView(View):
+    """AJAX view to check username availability"""
+    
+    def get(self, request):
+        username = request.GET.get('username')
+        if username:
+            is_available = not User.objects.filter(username=username).exists()
+            return JsonResponse({'available': is_available})
+        return JsonResponse({'available': False})
+
+
+class CheckEmailView(View):
+    """AJAX view to check email availability"""
+    
+    def get(self, request):
+        email = request.GET.get('email')
+        user_id = request.GET.get('user_id')
+        
+        if email:
+            queryset = User.objects.filter(email=email)
+            if user_id:
+                queryset = queryset.exclude(id=user_id)
+            
+            is_available = not queryset.exists()
+            return JsonResponse({'available': is_available})
+        
+        return JsonResponse({'available': False})
+
+
+class UserSearchView(LoginRequiredMixin, View):
+    """AJAX view for user search"""
+    
+    def get(self, request):
+        query = request.GET.get('q', '')
+        entity = request.GET.get('entity', '')
+        
+        users = User.objects.select_related('userprofile')
+        
+        if query:
+            users = users.filter(
+                Q(username__icontains=query) |
+                Q(first_name__icontains=query) |
+                Q(last_name__icontains=query) |
+                Q(email__icontains=query)
+            )
+        
+        if entity:
+            users = users.filter(userprofile__entity=entity)
+        
+        users = users[:10]  # Limit results
+        
+        results = []
+        for user in users:
+            results.append({
+                'id': user.id,
+                'username': user.username,
+                'full_name': user.get_full_name(),
+                'email': user.email,
+                'entity': getattr(user.userprofile, 'entity', None) if hasattr(user, 'userprofile') else None,
+                'is_active': user.is_active
+            })
+        
+        return JsonResponse({'users': results})
+
+
+# Additional utility views
+class PasswordResetView(FormView):
+    """Password reset request view"""
+    template_name = 'accounts/password_reset.html'
+    form_class = PasswordResetForm
+    success_url = reverse_lazy('accounts:login')
+
+    def form_valid(self, form):
+        # Send password reset email logic here
+        messages.success(self.request, 'Password reset email sent!')
+        return super().form_valid(form)
+
+
+class PasswordResetConfirmView(FormView):
+    """Password reset confirmation view"""
+    template_name = 'accounts/password_reset_confirm.html'
+    success_url = reverse_lazy('accounts:login')
+
+    def form_valid(self, form):
+        messages.success(self.request, 'Password reset successfully!')
+        return super().form_valid(form)
+
+
+class UserToggleActiveView(LoginRequiredMixin, PermissionRequiredMixin, View):
+    """Toggle user active status"""
+    permission_required = 'accounts.change_user'
+
+    def post(self, request, pk):
+        user = get_object_or_404(User, pk=pk)
+        user.is_active = not user.is_active
+        user.save()
+        
+        status_text = 'activated' if user.is_active else 'deactivated'
+        messages.success(request, f'User {user.username} has been {status_text}.')
+        
+        if request.headers.get('X-Requested-With') == 'XMLHttpRequest':
+            return JsonResponse({
+                'success': True,
+                'is_active': user.is_active,
+                'message': f'User {status_text} successfully'
+            })
+        
+        return redirect('accounts:user_list')
+
+
+class UserBulkActionView(LoginRequiredMixin, PermissionRequiredMixin, View):
+    """Handle bulk user actions"""
+    permission_required = 'accounts.change_user'
+
+    def post(self, request):
+        form = BulkUserActionForm(request.POST)
+        if form.is_valid():
+            action = form.cleaned_data['action']
+            user_ids = form.cleaned_data['user_ids'].split(',')
+            users = User.objects.filter(id__in=user_ids)
+            
+            if action == 'activate':
+                users.update(is_active=True)
+                messages.success(request, f'{users.count()} users activated.')
+            
+            elif action == 'deactivate':
+                users.update(is_active=False)
+                messages.success(request, f'{users.count()} users deactivated.')
+            
+            elif action == 'assign_role':
+                role = form.cleaned_data['role']
+                UserProfile.objects.filter(user__in=users).update(role=role)
+                messages.success(request, f'Role assigned to {users.count()} users.')
+            
+            elif action == 'remove_role':
+                UserProfile.objects.filter(user__in=users).update(role=None)
+                messages.success(request, f'Role removed from {users.count()} users.')
+        
+        return redirect('accounts:user_list')
+
+
+class AvatarUploadView(LoginRequiredMixin, View):
+    """Handle avatar upload"""
+    
+    def post(self, request):
+        if 'avatar' in request.FILES:
+            try:
+                profile = request.user.userprofile
+                profile.avatar = request.FILES['avatar']
+                profile.save()
+                messages.success(request, 'Avatar updated successfully!')
+            except UserProfile.DoesNotExist:
+                messages.error(request, 'Profile not found.')
+        
+        return redirect('accounts:profile')
+
+
+class UserExportView(LoginRequiredMixin, PermissionRequiredMixin, View):
+    """Export users to CSV"""
+    permission_required = 'accounts.view_user'
+
+    def get(self, request):
+        import csv
+        from django.http import HttpResponse
+        
+        response = HttpResponse(content_type='text/csv')
+        response['Content-Disposition'] = 'attachment; filename="users.csv"'
+        
+        writer = csv.writer(response)
+        writer.writerow(['Username', 'Email', 'First Name', 'Last Name', 'Entity', 'Department', 'Position', 'Is Active', 'Date Joined'])
+        
+        users = User.objects.select_related('userprofile')
+        for user in users:
+            profile = getattr(user, 'userprofile', None)
+            writer.writerow([
+                user.username,
+                user.email,
+                user.first_name,
+                user.last_name,
+                profile.entity if profile else '',
+                profile.department if profile else '',
+                profile.position if profile else '',
+                'Yes' if user.is_active else 'No',
+                user.date_joined.strftime('%Y-%m-%d')
+            ])
+        
+        return response
+
